@@ -22,7 +22,7 @@ popup_ramping_not_OK = popup_handler(
     "Action required",
     "Ramping not OK. Manually adjust PV CSETs to jitter the power supply before continue."
 )
-from .utils import display, cyclic_mean_var, suppress_outputs, sort_by_Dnum, validate_df_rows, df_mean, df_mean_var
+from .util import display, cyclic_mean_var, suppress_outputs, sort_by_Dnum, validate_df_rows, df_mean, df_mean_var
 script_dir = os.path.dirname(os.path.realpath(__file__))
 sys.path.append(os.path.join(script_dir, 'models/BPMQ'))
 from BPMQ_model import raw2Q_processor

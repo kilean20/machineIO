@@ -14,7 +14,7 @@ def display(obj):
     except:
         print(obj)
 
-from .utils import cyclic_distance, elu
+from .util import cyclic_distance, elu
 
 
 
