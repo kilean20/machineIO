@@ -1,11 +1,13 @@
 import re
 import io
 import os
+import sys
 import json
 import warnings
 import contextlib
 from typing import List, Optional, Tuple, Dict, Union, Callable
 import numpy as np
+import torch
 import pandas as pd
 from scipy import optimize
 import matplotlib.pyplot as plt
@@ -30,55 +32,126 @@ _name_conversions =(
     (':PSC2_', ':DCH_'),
     (':PSC1_', ':DCV_'),
 )
-SPEED_OF_LIGHT = 299_792_458  # m/s
-ATOMIC_MASS_UNIT_eV = 931_494_320  # eV/c²
+SPEED_OF_LIGHT = 299_792_458.0  # m/s
+ATOMIC_MASS_UNIT_eV = 931_494_320.0  # eV/c²
 
-def calculate_Brho(E_MeV_u: float, mass_number: float, charge_number: float, **kwargs) -> float:
+
+class dictClass(dict):
+    def __getattr__(self, name):
+        try:
+            return self[name]
+        except KeyError as e:
+            raise AttributeError(name) from e
+
+    __setattr__ = dict.__setitem__
+    __delattr__ = dict.__delitem__
+
+    def __repr__(self):
+        if self.keys():
+            m = max(map(len, list(self.keys()))) + 1
+            return '\n'.join([k.rjust(m) + ': ' + repr(v)
+                              for k, v in sorted(self.items())])
+        else:
+            return self.__class__.__name__ + "()"
+
+    def __dir__(self):
+        return list(self.keys())
+
+
+# Brho calculation with input compatibility
+def calculate_Brho(E_MeV_u, mass_number, charge_number) -> torch.Tensor:
+    E_MeV_u = torch.as_tensor(E_MeV_u, dtype=torch.float64)
+    mass_number = torch.as_tensor(mass_number, dtype=torch.float64)
+    charge_number = torch.as_tensor(charge_number, dtype=torch.float64)
+
     E = E_MeV_u * 1e6 + ATOMIC_MASS_UNIT_eV  # Total energy in eV
-    p = mass_number * np.sqrt(E**2 - ATOMIC_MASS_UNIT_eV**2) / SPEED_OF_LIGHT  # Momentum p in eV/c
-    return p / charge_number  # Brho
+    p = mass_number * torch.sqrt(E**2 - ATOMIC_MASS_UNIT_eV**2) / SPEED_OF_LIGHT  # Momentum in eV/c
+    return p / charge_number
 
-# Calculate beta-gamma
-def calculate_betagamma(E_MeV_u: float, mass_number: float, **kwargs) -> float:
-    c = 299792458  # Speed of light in m/s
-    Ma = 931494320  # Atomic mass unit in eV/c^2
-    E = E_MeV_u * 1e6 + Ma  # Total energy in eV
-    return np.sqrt(E**2 - Ma**2) / Ma  # Beta-gamma
-    
-# Exponential linear unit (ELU) function
-def elu(x: float) -> float:
-    return x if x > 0 else np.exp(x) - 1
+# Beta-gamma calculation
+def calculate_betagamma(E_MeV_u, mass_number) -> torch.Tensor:
+    E_MeV_u = torch.as_tensor(E_MeV_u, dtype=torch.float64)
+    mass_number = torch.as_tensor(mass_number, dtype=torch.float64)
 
+    E = E_MeV_u * 1e6 + ATOMIC_MASS_UNIT_eV
+    return torch.sqrt(E**2 - ATOMIC_MASS_UNIT_eV**2) / ATOMIC_MASS_UNIT_eV
 
-# Calculate cyclic distance
-def cyclic_distance(x: float, y: float, Lo: float, Hi: float) -> float:
-    assert Lo < Hi, "Invalid range"
-    x_ang = 2 * np.pi * (x - Lo) / (Hi - Lo)
-    y_ang = 2 * np.pi * (y - Lo) / (Hi - Lo)
-    return np.arccos(np.cos(y_ang - x_ang)) / np.pi * 0.5 * (Hi - Lo)
+# ELU with gradient support and input safety
+def elu(x) -> torch.Tensor:
+    x = torch.as_tensor(x, dtype=torch.float64)
+    return torch.where(x > 0, x, torch.exp(x) - 1)
 
-# Calculate cyclic mean
-def cyclic_mean(x: List[float], Lo: float, Hi: float) -> float:
-    x_ = np.array(x)
-    if x_.ndim == 1 and len(x_) < 1:
-        return x_
-    mean = np.mod(np.angle(np.mean(np.exp(1j * 2 * np.pi * (x_ - Lo) / (Hi - Lo)), axis=0)), 2 * np.pi) / (2 * np.pi) * (Hi - Lo) + Lo
+# Cyclic distance with tensor conversion and gradient support
+def cyclic_distance(x, y, period, eps=1e-2) -> torch.Tensor:
+    x = torch.as_tensor(x, dtype=torch.float64)
+    y = torch.as_tensor(y, dtype=torch.float64)
+    period = torch.as_tensor(period, dtype=torch.float64)
+    delta = (x - y + period / 2) % period - period / 2
+    return torch.abs(delta)
+
+def cyclic_mean(x: Union[List[float], np.ndarray, torch.Tensor], Lo: float, Hi: float) -> torch.Tensor:
+    x = torch.as_tensor(x, dtype=torch.float64)
+    period = Hi - Lo
+    if x.numel() == 0:
+        return torch.tensor(float('nan'), dtype=torch.float64)
+    elif x.numel() == 1:
+        return x.clone()
+    angles = 2 * torch.pi * (x - Lo) / period
+    mean_angle = torch.angle(torch.mean(torch.exp(1j * angles)))
+    mean = (mean_angle % (2 * torch.pi)) / (2 * torch.pi) * period + Lo
     return mean
-    
-# Calculate cyclic mean and variance
-def cyclic_mean_var(x: List[float], Lo: float, Hi: float) -> Tuple[float, float]:
-    x_ = np.array(x)
-    if x_.ndim == 1 and len(x_) < 1:
-        return x_, np.zeros(x_.shape)
+
+
+def cyclic_mean_var(x: Union[List[float], np.ndarray, torch.Tensor], Lo: float, Hi: float) -> Tuple[torch.Tensor, torch.Tensor]:
+    x = torch.as_tensor(x, dtype=torch.float64)
+    period = Hi - Lo
+    if x.numel() == 0:
+        return torch.tensor(float('nan'), dtype=torch.float64), torch.tensor(float('nan'), dtype=torch.float64)
+    elif x.numel() == 1:
+        return x.clone(), torch.tensor(0.0, dtype=torch.float64)
     mean = cyclic_mean(x, Lo, Hi)
-    return mean, np.mean(cyclic_distance(x, mean, Lo, Hi) ** 2)
+    var = torch.mean(cyclic_distance(x, mean, period) ** 2)
+    return mean, var
+
+def cyclic_difference(x, y, Lo: float, Hi: float, smooth_sign=False, k=100.0) -> torch.Tensor:
+    x = torch.as_tensor(x, dtype=torch.float64)
+    y = torch.as_tensor(y, dtype=torch.float64)
+    period = Hi - Lo
+    x_ang = 2 * torch.pi * (x - Lo) / period
+    y_ang = 2 * torch.pi * (y - Lo) / period
+    distance = cyclic_distance(x, y, period)
+    if smooth_sign:
+        # Use a smooth approximation of sign: tanh(k * x)
+        sign_approx = torch.tanh(k * torch.sin(y_ang - x_ang))
+        return distance * sign_approx
+    else:
+        # Original sign function (not differentiable at zero)
+        return distance * torch.sign(torch.sin(y_ang - x_ang))
     
-# Calculate cyclic difference
-def cyclic_difference(x: float, y: float, Lo: float, Hi: float) -> float:
-    x_ang = 2 * np.pi * (x - Lo) / (Hi - Lo)
-    y_ang = 2 * np.pi * (y - Lo) / (Hi - Lo)
-    distance = cyclic_distance(x, y, Lo, Hi)
-    return distance * np.sign(np.sin(y_ang - x_ang))
+
+def df_mean(df):
+    mean = df.mean()
+    for col in df.columns:
+        if 'PHASE' in col:
+            if 'BPM' in col:
+                mean[col] = cyclic_mean(df[col], -90, 90)
+            else:
+                mean[col] = cyclic_mean(df[col], -180, 180)
+    return mean
+
+def df_mean_var(df):
+    mean = df.mean()
+    mean.name = df.index[0]
+    var = df.var()
+    var.name = df.index[0]
+    for col in df.columns:
+        if 'obj' not in col:
+            if 'PHASE' in col:
+                if 'BPM' in col:
+                    mean[col], var[col]= cyclic_mean_var(df[col], -90, 90)
+                else:
+                    mean[col], var[col]= cyclic_mean_var(df[col], -180, 180)
+    return mean, var
 
             
 # Nelder-Mead optimization
@@ -721,3 +794,136 @@ def order_samples(samples,
         x0 = ordered_samples[-1]
         
     return np.array(ordered_samples)
+
+
+
+def progressbar(it, prefix="", size=40, out=sys.stdout): # Python3.6+
+    count = len(it)
+    def show(j):
+        x = int(size*j/count)
+        print(f"{prefix}[{u'█'*x}{('.'*(size-x))}] {int(j/count*100)}%/{100}%", end='\r', file=out, flush=True)
+    show(0)
+    for i, item in enumerate(it):
+        yield item
+        show(i+1)
+    print("\n", flush=True, file=out)
+
+
+def plot_2D_projection(
+                        func,
+                        bounds,
+                        dim_xaxis = 0,
+                        dim_yaxis = 1,
+                        grid_ponits_each_dim = 25, 
+                        project_maximum = True,
+                        project_mode = None,
+                        fixed_values_for_each_dim = None, 
+                        overdrive = False,
+                        fig = None,
+                        ax = None,
+                        colorbar = True,
+                        dtype = np.float32 ):
+        '''
+        bounds : shape (dim,2) array
+        fixed_values_for_each_dim: dict of key: dimension, val: value to fix for that dimension
+        '''
+        
+        n_fixed = 0
+        if fixed_values_for_each_dim is not None:
+            n_fixed = len(fixed_values_for_each_dim.keys())
+            assert dim_xaxis not in fixed_values_for_each_dim.keys()
+            assert dim_yaxis not in fixed_values_for_each_dim.keys()
+        else:
+            fixed_values_for_each_dim = {}
+            
+        dim = len(bounds)  
+        
+        project_minimum = False
+        project_mean = False
+        if project_mode is not None:
+            if project_mode in ['MAX', 'max', 'Max']:
+                project_maximum = True
+            elif project_mode in ['MIN', 'min', 'Min']:
+                project_minimum = True
+                project_maximum = False
+            elif project_mode in ['MEAN', 'mean', 'Mean','Average', 'Ave', 'ave']:
+                project_mean = True,
+                project_maximum = False
+        if dim > 2+n_fixed:
+            assert project_minimum + project_maximum + project_mean == 1
+        
+        batch_size = 1
+        for n in range(dim-2-n_fixed):
+            batch_size*=grid_ponits_each_dim
+            if batch_size*dim > 2e4:
+                if overdrive or not (project_minimum or project_mean):
+                    batch_size = int(batch_size/grid_ponits_each_dim)
+                    print("starting projection plot...")
+                    break
+                else:
+                    raise RuntimeError("Aborting: due to high-dimensionality and large number of grid point, minimum or mean projection plot may take long time. Try to reduce 'grid_ponits_each_dim' or turn on 'overdrive' if long time waiting is OK'")
+        n_batch = int(grid_ponits_each_dim**(dim-n_fixed-2)/batch_size)
+        linegrid = np.linspace(0,1,grid_ponits_each_dim)
+        x_grid = np.zeros((grid_ponits_each_dim*grid_ponits_each_dim,dim))
+        y_grid = np.zeros((grid_ponits_each_dim*grid_ponits_each_dim))
+        
+        n = 0
+        for i in progressbar(range(grid_ponits_each_dim)):
+            bounds_xaxis = bounds[dim_xaxis,:]
+            for j in range(grid_ponits_each_dim):
+                bounds_yaxis = bounds[dim_yaxis,:]
+                x_grid[n,dim_xaxis] = linegrid[i]*(bounds_xaxis[1]-bounds_xaxis[0])+bounds_xaxis[0]
+                x_grid[n,dim_yaxis] = linegrid[j]*(bounds_yaxis[1]-bounds_yaxis[0])+bounds_yaxis[0]
+                if (project_minimum or project_maximum or project_mean) and dim > 2+n_fixed:
+                    inner_grid = []
+                    for d in range(dim):
+                        if d == dim_xaxis:
+                            inner_grid.append([x_grid[n,dim_xaxis]])
+                        elif d == dim_yaxis:
+                            inner_grid.append([x_grid[n,dim_yaxis]])
+                        elif d in fixed_values_for_each_dim.keys():
+                            inner_grid.append([fixed_values_for_each_dim[d]])
+                        else:
+                            inner_grid.append(np.linspace(bounds[d,0],
+                                                          bounds[d,1],
+                                                          grid_ponits_each_dim))
+                    inner_grid = np.meshgrid(*inner_grid)
+                    inner_grid = np.array(list(list(x.flat) for x in inner_grid),dtype=dtype).T
+                    
+                    y = []
+                    for b in range(n_batch):
+                        i1 = b*batch_size
+                        i2 = i1 + batch_size
+                        x_batch = inner_grid[i1:i2]
+                        y.append(func(x_batch))
+                    y = np.concatenate(y, axis=0)
+
+                    if project_minimum or project_maximum:
+                        if project_minimum:
+                            arg_project = np.nanargmin
+                        elif project_maximum:
+                            arg_project = np.nanargmax
+                        iproj = arg_project(y)
+                        y_grid[n] = y[iproj]
+                        x_grid[n,:] = inner_grid[iproj]
+                    elif project_mean:
+                        y_grid[n] = np.nanmean(y_mean)
+                n+=1
+                
+        if dim==2+n_fixed:
+            if fixed_values_for_each_dim is not None:
+                for dim,val in fixed_values_for_each_dim.items():
+                    x_grid[:,dim]  = val   
+            y_grid  = func(x_grid)
+            
+        iNaN = np.any([np.isnan(x_grid).any(axis=1),np.isnan(y_grid)],axis=0)
+        x_grid = x_grid[~iNaN,:]
+        y_grid = y_grid[~iNaN  ]
+                           
+        if ax is None:
+            fig, ax = plt.subplots(figsize=(3.5,3),dpi=96)
+        cs = ax.tricontourf(x_grid[:,dim_xaxis], x_grid[:,dim_yaxis], y_grid, levels=64, cmap="viridis");
+        if colorbar:
+            fig.colorbar(cs,ax=ax,shrink=0.95)
+            
+        return cs

@@ -7,7 +7,7 @@ import warnings
 import numpy as np
 import pandas as pd
 import concurrent
-from typing import Optional, List, Union, Dict
+from typing import Optional, List, Union, Dict, Callable, Tuple
 from copy import deepcopy as copy
 from abc import ABC, abstractmethod
 from threading import Lock
@@ -20,9 +20,9 @@ logger = logging.getLogger(__name__)
 from .gui import popup_handler
 popup_ramping_not_OK = popup_handler(
     "Action required",
-    "Ramping not OK. Manually adjust PV CSETs to jitter the power suppply before continue."
+    "Ramping not OK. Manually adjust PV CSETs to jitter the power supply before continue."
 )
-from .utils import display, cyclic_mean_var, suppress_outputs, sort_by_Dnum, validate_df_rows
+from .utils import display, cyclic_mean_var, suppress_outputs, sort_by_Dnum, validate_df_rows, df_mean, df_mean_var
 script_dir = os.path.dirname(os.path.realpath(__file__))
 sys.path.append(os.path.join(script_dir, 'models/BPMQ'))
 from BPMQ_model import raw2Q_processor
@@ -155,6 +155,8 @@ class _fetch_data_wrapper:
         self.fetch_data_base = fetch_data_base
         self.isOK_PVs = [] if isOK_PVs is None or test else isOK_PVs
         self.isOK_vals = np.array([] if isOK_vals is None or test else isOK_vals)
+        if not test and isOK_PVs is not None and isOK_vals is not None:
+            assert len(isOK_PVs) == len(isOK_vals), "isOK_PVs and isOK_vals must have the same length"
         self.test = test
 
     def __call__(self, pvlist: List[str], 
@@ -306,7 +308,6 @@ class AbstractMachineIO(ABC):
                    sample_interval : float = None,
                    verbose: Optional[bool] = None,
                    **kws):
-        
         data = self._fetch_data(pvlist,
                                      time_span = time_span or self._fetch_data_time_span, 
                                      sample_interval = sample_interval or self._sample_interval,
@@ -314,7 +315,6 @@ class AbstractMachineIO(ABC):
                                      )
         if self._verbose if verbose is None else verbose:
             display(data)
-
         return data
     
     
@@ -377,23 +377,25 @@ TISRAW_VECTOR_LENGTH = 68
 class Evaluator:
     def __init__(self,
                  machineIO,
-                 input_CSETs: List[str],
-                 input_RDs  : List[str],
-                 input_tols : Union[List[float], np.ndarray],
-                 output_RDs : Optional[List[str]] = None,
+                 control_CSETs: List[str],
+                 control_RDs  : List[str],
+                 control_tols : Union[List[float], np.ndarray],
+                 monitor_RDs : Optional[List[str]] = None,
                  ensure_set_kwargs: Optional[Dict] = None,
                  fetch_data_kwargs: Optional[Dict] = None,
                  set_manually : Optional[bool] = False, 
+                 df_manipulators : Optional[List[Callable]] = None,
+                 return_meanvar_only : Optional[bool] = False, 
                  ):
         """
         Initialize the evaluator with machine I/O and data sets.
 
         Args:
             machineIO: Instance of AbstractMachineIO for hardware interaction.
-            input_CSETs: List of control setpoint PVs.
-            input_RDs: List of readback PVs corresponding to setpoints.
-            input_tols: Tolerances for setpoint verification.
-            output_RDs: Optional list of additional readback PVs (default: []).
+            control_CSETs: List of control setpoint PVs.
+            control_RDs: List of readback PVs corresponding to setpoints.
+            control_tols: Tolerances for setpoint verification.
+            monitor_RDs: Optional list of additional readback PVs (default: []).
             ensure_set_kwargs: Optional kwargs for ensure_set method (default: {}).
             fetch_data_kwargs: Optional kwargs for fetch_data method (default: {}).
             set_manually: If True, skip automatic setting (default: False).
@@ -404,32 +406,47 @@ class Evaluator:
         self.machineIO = machineIO
         self.ensure_set_kwargs = ensure_set_kwargs or {}
         self.fetch_data_kwargs = fetch_data_kwargs or {}
-        assert isinstance(input_CSETs, list), f"Expected input_CSETs to be of type list, but got {type(input_CSETs).__name__}"
-        assert isinstance(input_RDs  , list), f"Expected input_RDs to be of type list, but got {type(input_RDs).__name__}"
-        assert isinstance(input_tols , (list, np.ndarray)), f"Expected input_tols to be of type list or np.ndarray, but got {type(input_tols).__name__}"
-        if output_RDs is None:
-            output_RDs = []
-        assert isinstance(output_RDs , list), f"Expected output_RDs to be of type list, but got {type(output_RDs).__name__}"
-        self.input_CSETs = input_CSETs
-        self.input_RDs   = input_RDs
-        self.input_tols  = input_tols
-        self.output_RDs  = output_RDs
+        assert isinstance(control_CSETs, list), f"Expected control_CSETs to be of type list, but got {type(control_CSETs).__name__}"
+        assert isinstance(control_RDs  , list), f"Expected control_RDs to be of type list, but got {type(control_RDs).__name__}"
+        assert isinstance(control_tols , (list, np.ndarray)), f"Expected control_tols to be of type list or np.ndarray, but got {type(control_tols).__name__}"
+        if monitor_RDs is None:
+            monitor_RDs = []
+        assert isinstance(monitor_RDs , list), f"Expected monitor_RD to be of type list, but got {type(monitor_RDs).__name__}"
+        
+        self.control_CSETs = control_CSETs
+        self.control_RDs   = control_RDs
+        self.control_tols  = control_tols
+        self.monitor_RDs = monitor_RDs
         self.set_manually = set_manually
-
-        self.fetch_data_monitors = list(set(input_CSETs + input_RDs + output_RDs))
-        self.ensure_set_monitors = [m for m in self.fetch_data_monitors if m not in input_RDs and m not in input_CSETs]
+        self.df_manipulators = df_manipulators
+        self.return_meanvar_only = return_meanvar_only
+        
+        self.fetch_data_monitors = list(set(control_CSETs + control_RDs + monitor_RDs))
+        self.ensure_set_monitors = [m for m in self.fetch_data_monitors if m not in control_RDs and m not in control_CSETs]
 
         self.TISRAW_PVs = [pv for pv in self.fetch_data_monitors if ':TISRAW' in pv]
         self.vector_PVs = [self.TISRAW_PVs]
         self.vector_len = [TISRAW_VECTOR_LENGTH]
         self.scalar_PVs = list(set(self.fetch_data_monitors) - set(self.TISRAW_PVs))
+
+        self._history_lock = Lock()
+        self.history = {'mean':[],
+                        'var':[],
+                        'ramping_mean':[],
+                        'ramping_var':[]}
         
-        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
         
     def read(self, fetch_data_kwargs: Optional[Dict] = None):
         fetch_data_kwargs = fetch_data_kwargs or self.fetch_data_kwargs
         df = self.machineIO.fetch_data(self.fetch_data_monitors,**fetch_data_kwargs)
         df = validate_df_rows(df, self.vector_PVs, self.vector_len)
+        if self.df_manipulators is not None:
+            for f in self.df_manipulators:
+                if callable(f):
+                    df = f(df)
+                else:
+                    raise ValueError(f"df_manipulators should be a callable, but got {type(f).__name__}")
         return df
         
     def _set_and_read(self, x,                 
@@ -445,19 +462,37 @@ class Evaluator:
         if self.set_manually:
             ret, ramping_data = 'PutFinish', None
         else:
-            ret, ramping_data = self.machineIO.ensure_set(self.input_CSETs, 
-                                                          self.input_RDs, 
+            ret, ramping_data = self.machineIO.ensure_set(self.control_CSETs, 
+                                                          self.control_RDs, 
                                                           x,
-                                                          self.input_tols,
+                                                          self.control_tols,
                                                           extra_monitors=self.ensure_set_monitors,
                                                           **ensure_set_kwargs)
             if ramping_data is not None:
                 ramping_data = validate_df_rows(ramping_data, self.vector_PVs, self.vector_len)
+                if self.df_manipulators is not None:
+                    for f in self.df_manipulators:
+                        if callable(f):
+                            ramping_data = f(ramping_data)
+                        else:
+                            raise ValueError(f"df_manipulator should be a callable, but got {type(f).__name__}")
+                ramping_mean, ramping_var = df_mean_var(ramping_data)
+                with self._history_lock:
+                    self.history['ramping_mean'].append(ramping_mean)
+                    self.history['ramping_var'].append(ramping_var)
                                                           
         data = self.read()
-        #print("_set_and_read raw data")
-        #display(data)
+        mean, var = df_mean_var(data)
+        with self._history_lock:
+            self.history['mean'].append(mean)
+            self.history['var'].append(var)
+                
+        if self.return_meanvar_only:
+            data = (mean, var)
+            ramping_data = (ramping_mean, ramping_var) if ramping_data is not None else None
+        
         return data, ramping_data
+
 
     def submit(self, x, 
         ensure_set_kwargs = None,
@@ -467,16 +502,16 @@ class Evaluator:
         Submit a task to set and read data asynchronously.
         """
         if self.set_manually:
-            display(pd.DataFrame(x,index=self.input_CSETs).T)
+            display(pd.DataFrame(x,index=self.control_CSETs).T)
             if isinstance(x,np.ndarray):
                 x_ = x.tolist()
             else:
                 x_ = x
-            if isinstance(self.input_tols,np.ndarray):
-                tol = x.tolist()
+            if isinstance(self.control_tols,np.ndarray):
+                tol = self.control_tols.tolist()
             else:
-                tol = self.input_tols
-            print(f"ensure_set({self.input_CSETs},{self.input_RDs},{x_},tol={tol},timeout={self.machineIO._ensure_set_timeout})")
+                tol = self.control_tols
+            print(f"ensure_set({self.control_CSETs},{self.control_RDs},{x_},tol={tol},timeout={self.machineIO._ensure_set_timeout})")
             input("Set the above PVs and press any key to continue...")
         
         future = self.executor.submit(self._set_and_read, x, 
@@ -490,66 +525,85 @@ class Evaluator:
         """
         return future.done()
 
-    def get_result(self, future: concurrent.futures.Future):
+    def get_result(self, future: concurrent.futures.Future) -> Tuple[Union[np.ndarray, pd.DataFrame], Union[np.ndarray, pd.DataFrame]]:
         """
         Retrieve the result from the future.
         """
         data, ramping_data = future.result()
         self._data = data
-        self._rampling_data = ramping_data
+        self._ramping_data = ramping_data
         return data, ramping_data
 
+    def get_history(self, ignore_index: bool = False, columns: Optional[List[str]] = None) -> Dict[str, pd.DataFrame]:
+        history = {}
+        for k, v in self.history.items():
+            if not v:
+                history[k] = pd.DataFrame(columns=columns) if columns else pd.DataFrame()
+            else:
+                df = pd.concat([s.to_frame().T for s in v], ignore_index=ignore_index)
+                if columns:
+                    df = df.reindex(columns=columns, fill_value=np.nan)
+                history[k] = df
+        return history
 
+    def clear_history(self):
+        """
+        Clear the history of the evaluator.
+        """
+        with self._history_lock:
+            self.history = {'mean':[],
+                            'var':[],
+                            'ramping_mean':[],
+                            'ramping_var':[]}
+    
+    def dump_history(self, filename: str):
+        """
+        Dump the history to a pkl file.
+        """
+        if not filename.endswith('.pkl'):
+            filename += '.pkl'
+        history = self.get_history_df()
+        with open(filename, 'wb') as f:
+            pd.to_pickle(history, f)
             
-class Evaluator_wBPMQ(Evaluator):
+class Evaluator_wBPMQ(Evaluator):        
     def __init__(self,
                  machineIO,
-                 input_CSETs: List[str],
-                 input_RDs  : List[str],
-                 input_tols : Union[List[float], np.ndarray],
-                 output_RDs : Optional[List[str]] = None,
-                 BPM_names  : List[str] = None,
+                 control_CSETs: List[str],
+                 control_RDs  : List[str],
+                 control_tols : Union[List[float], np.ndarray],
+                 BPM_names  : List[str],
                  model_type : str = 'TIS161',
+                 monitor_RDs : Optional[List[str]] = None,
                  ensure_set_kwargs: Optional[Dict] = None,
                  fetch_data_kwargs: Optional[Dict] = None,
-                 set_manually : Optional[bool] = False,
+                 set_manually : Optional[bool] = False, 
+                 df_manipulators : Optional[List[Callable]] = None,
+                 return_meanvar_only : Optional[bool] = False, 
                  ):
-                 
-        if output_RDs is None:
-            output_RDs = []
+           
+        if monitor_RDs is None:
+            monitor_RDs = []
         else:
-            assert isinstance(output_RDs, list), f"Expected output_RDs to be a list, but got {type(output_RDs).__name__}"
+            assert isinstance(monitor_RDs, list), f"Expected monitor_RDs to be a list, but got {type(monitor_RDs).__name__}"
 
-        if BPM_names is not None:
-            BPM_names = sort_by_Dnum(BPM_names)
-            self.raw2Q = raw2Q_processor(BPM_names=BPM_names,model_type=model_type)
-            output_RDs = list(set(output_RDs + self.raw2Q.PVs2read))
+        BPM_names = sort_by_Dnum(BPM_names)
+        self.raw2Q = raw2Q_processor(BPM_names=BPM_names,model_type=model_type)
+        monitor_RDs = monitor_RDs + [pv for pv in self.raw2Q.PVs2read if pv not in monitor_RDs]
+
+        if df_manipulators is None:
+            df_manipulators = [self.raw2Q]
+        else:
+             df_manipulators.append(self.raw2Q)
 
         super().__init__(machineIO, 
-                         input_CSETs= input_CSETs, 
-                         input_RDs  = input_RDs,
-                         input_tols = input_tols,
-                         output_RDs = output_RDs,
+                         control_CSETs= control_CSETs, 
+                         control_RDs  = control_RDs,
+                         control_tols = control_tols,
+                         monitor_RDs = monitor_RDs,
                          ensure_set_kwargs = ensure_set_kwargs,
                          fetch_data_kwargs = fetch_data_kwargs,
                          set_manually   = set_manually, 
+                         df_manipulators = df_manipulators,
+                         return_meanvar_only = return_meanvar_only,
                          )
-    def read(self, fetch_data_kwargs: Optional[Dict] = None):
-        fetch_data_kwargs = fetch_data_kwargs or self.fetch_data_kwargs
-        # print("self.fetch_data_monitors",self.fetch_data_monitors)
-        data = self.machineIO.fetch_data(self.fetch_data_monitors,**fetch_data_kwargs)
-        data = validate_df_rows(data, self.vector_PVs, self.vector_len)
-        return self.raw2Q(data)
-        
-   
-    def get_result(self, future: concurrent.futures.Future):
-        """
-        Retrieve the result from the future.
-        """
-        data, ramping_data = future.result()
-        data = self.raw2Q(data)
-        if ramping_data is not None:
-            ramping_data = self.raw2Q(ramping_data)
-        self._data = data
-        self._rampling_data = ramping_data
-        return data, ramping_data
