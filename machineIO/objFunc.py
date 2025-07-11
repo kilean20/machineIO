@@ -147,7 +147,7 @@ class SingleTaskObjectiveFunction:
                 goal = self.objective_goal[pv]
                 values = flattened[:, idx]
                 
-                if isinstance(goal, float):
+                if isinstance(goal, float) or isinstance(goal, int):
                     if 'BPM' in pv and 'PHASE' in pv:
                         obj = 1 - (torch.abs(cyclic_distance(values, goal, 180) / self.objective_tolerance[pv])) ** self.p_order
                     else:
