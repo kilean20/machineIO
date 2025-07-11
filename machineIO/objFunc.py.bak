@@ -155,7 +155,7 @@ class SingleTaskObjectiveFunction:
                 elif 'more than' in goal:
                     obj =  -elu(-(values - goal['more than']) / self.objective_tolerance[pv]) ** self.p_order
                 elif 'less than' in goal:
-                    obj =  -elu( (values - goal['less than']) / self.objective_tolerance[pv]) ** self.p_order
+                    obj =  -elu((values - goal['less than']) / self.objective_tolerance[pv]) ** self.p_order
                 else:
                     raise RuntimeError("Goal must be float or dict with 'more than' or 'less than'")
                 

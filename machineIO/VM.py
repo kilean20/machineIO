@@ -9,6 +9,12 @@ try:
     from IPython.display import display as _display
 except ImportError:
     _display = print
+
+try:
+    import torch
+except ImportError:
+    torch = None
+
 def display(obj):
     try:
         _display(obj)
@@ -132,6 +138,7 @@ class VirtualMachineIO:
                  monitor_min: Optional[List[float]] = None,
                  monitor_max: Optional[List[float]] = None,
                  fun: Optional[Callable] = None,
+                 x0: Optional[List[float]] = None,
                  fetch_data_time_span: Optional[float] = 2.0,
                  sample_interval: Optional[float] = 0.2,
                  ramping_rate: Optional[float] = None,
@@ -158,6 +165,13 @@ class VirtualMachineIO:
 
         self.control_min = np.array(control_min) if control_min is not None else np.zeros(len(control_CSETs))
         self.control_max = np.array(control_max) if control_max is not None else np.ones (len(control_CSETs))
+        if x0 is None:
+            x0 = np.random.rand(len(control_CSETs)) * (self.control_max - self.control_min) + self.control_min
+        else:
+            assert len(x0) == len(control_CSETs), f"x0 should have the same length as control_CSETs, expected {len(control_CSETs)}, got {len(x0)}"
+            x0 = np.array(x0)
+            assert np.all(x0 >= self.control_min) and np.all(x0 <= self.control_max), "x0 values must be within control_min and control_max bounds."
+        self.x = np.array(x0).copy()
         self.monitor_min = np.array(monitor_min) if monitor_min is not None else np.zeros(len(monitor_RDs  ))
         self.monitor_max = np.array(monitor_max) if monitor_max is not None else np.ones (len(monitor_RDs  ))
             
@@ -168,11 +182,21 @@ class VirtualMachineIO:
             self.y_min = np.min(y_test, axis=0)
             self.y_max = np.max(y_test, axis=0)
             # Define normalized objective function
-            def fun(x):
+            def wrapped_fun(x):
                 xn = (np.array(x).reshape(1,-1)-self.control_min)/(self.control_max-self.control_min)
                 yn = randNN(xn)
                 return yn*(self.monitor_max-self.monitor_min) + self.monitor_min
-        self.fun = fun
+        else:
+            # test
+            wrapped_fun = fun
+            y = fun(self.x)
+            if torch is not None:
+                if isinstance(y, torch.Tensor):
+                    def wrapped_fun(x):
+                        with torch.no_grad():
+                            y = fun(x)
+                        return y.numpy()                
+        self.fun = wrapped_fun
         self.dt = sample_interval
         self.fetch_data_time_span = fetch_data_time_span
         if ramping_rate is None:
@@ -221,7 +245,11 @@ class VirtualMachineIO:
             step = np.clip(delta, -max_steps_per_dt, max_steps_per_dt)
             current_x += step
             self(current_x)
-            vals.append(list(current_x) + list(self.xrd) + list(self.y))
+            if isinstance(self.y, np.ndarray):
+                y_list = [self.y.item()] if self.y.ndim == 0 else list(self.y)
+            else:
+                y_list = [self.y]
+            vals.append(list(current_x) + list(self.xrd) + y_list)
             if tol is not None:
                 if np.allclose(delta, 0, atol=tol):
                     index = index[:i+1]
