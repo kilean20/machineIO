@@ -37,17 +37,19 @@ def display(obj):
 
 class RandomNeuralNetwork:
     def __init__(self, n_input: int, n_output: int, hidden_layers: Optional[List[int]] = None, 
-                 activation_functions: Optional[List[str]] = None):
+                 activation_functions: Optional[List[str]] = None, complexity: Optional[int]=1):
         self.n_input = n_input
         self.n_output = n_output
+        self.complexity = complexity or 1
         
         # Determine the minimum and maximum number of nodes in hidden layers based on input and output dimensions
-        min_node = int(np.clip(np.log2((n_input+n_output)**0.2), a_min=4, a_max=11))
-        max_node = int(np.clip(np.log2((n_input+n_output)), a_min=min(min_node+3,10), a_max=12))
+        min_node = int(np.clip(np.log2((n_input+n_output)**0.2), a_min=4, a_max=8))
+        max_node = int(np.clip(np.log2((n_input+n_output)), a_min=min(min_node+3,8), a_max=16))
         
         # Initialize hidden_layers if not provided with random values within a specified range
         if hidden_layers is None:
-            hidden_layers = [2**np.random.randint(min_node, max_node) for _ in range(np.random.randint(4, 7))]  # 4, 5, or 6 layers
+            hidden_layers = [2**np.random.randint(min_node*self.complexity, max_node*self.complexity) 
+                             for _ in range(np.random.randint(4*self.complexity, 8*self.complexity))]  # 4, 5, or 6 layers
         
         # Calculate the total number of layers and layer dimensions
         self.n_layers: int = len(hidden_layers) + 2
@@ -77,12 +79,12 @@ class RandomNeuralNetwork:
         parameters = {}
         for l in range(1, self.n_layers):
             # scale_weights = np.sqrt(2.0 / self.layer_dims[l - 1])  # He initialization for weights
-            scale_weights = np.sqrt(0.5 / self.layer_dims[l - 1])  
+            scale_weights = 2*np.sqrt(0.5 / self.layer_dims[l - 1])*self.complexity**4
             parameters[f'W{l}'] = np.random.randn(self.layer_dims[l], self.layer_dims[l-1]) * scale_weights
 
             # Initialize biases with small random values
             # scale_biases = np.sqrt(0.5 / self.layer_dims[l])
-            parameters[f'b{l}'] = np.random.randn(self.layer_dims[l], 1)# * scale_biases
+            parameters[f'b{l}'] = np.random.randn(self.layer_dims[l], 1)*self.complexity**4 # * scale_biases
 
         return parameters
     
@@ -143,6 +145,7 @@ class VirtualMachineIO:
                  sample_interval: Optional[float] = 0.2,
                  ramping_rate: Optional[float] = None,
                  verbose: Optional[bool] = False,
+                 complexity: Optional[int] = 1,
                  ):
         if monitor_RDs is None:
             monitor_RDs = []
@@ -203,7 +206,7 @@ class VirtualMachineIO:
             ramping_rate = 0.1*(self.control_max-self.control_min)
         self.ramping_rate = ramping_rate
 
-        self(np.random.rand(len(self.control_CSETs))*(self.control_max-self.control_min) + self.control_min)
+        self(x0)#np.random.rand(len(self.control_CSETs))*(self.control_max-self.control_min) + self.control_min)
         self.t = datetime.datetime.now()
 
         self._verbose = verbose or False

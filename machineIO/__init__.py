@@ -1,4 +1,4 @@
 from .construct_machineIO import *
-from . import VM
+from .VM import VirtualMachineIO
 from . import util
 from . import objFunc
