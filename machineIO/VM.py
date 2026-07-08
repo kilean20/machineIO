@@ -134,7 +134,7 @@ class VirtualMachineIO:
     def __init__(self,
                  control_CSETs: List[str],
                  control_RDs: List[str],
-                 monitor_RDs: List[str],
+                 monitor_PVs: List[str],
                  control_min: Optional[List[float]] = None,
                  control_max: Optional[List[float]] = None,
                  monitor_min: Optional[List[float]] = None,
@@ -147,24 +147,24 @@ class VirtualMachineIO:
                  verbose: Optional[bool] = False,
                  complexity: Optional[int] = 1,
                  ):
-        if monitor_RDs is None:
-            monitor_RDs = []
+        if monitor_PVs is None:
+            monitor_PVs = []
             
         assert isinstance(control_CSETs, list), f"Expected control_CSETs to be of type list, but got {type(control_CSETs).__name__}"
         assert isinstance(control_RDs,   list), f"Expected control_RDs to be of type list, but got {type(control_RDs).__name__}"
-        assert isinstance(monitor_RDs,   list), f"Expected monitor_RDs to be of type list, but got {type(monitor_RDs).__name__}"
+        assert isinstance(monitor_PVs,   list), f"Expected monitor_PVs to be of type list, but got {type(monitor_PVs).__name__}"
 
         assert len(control_CSETs) == len(set(control_CSETs)), "control_CSETs contains duplicates"
         assert len(control_RDs)   == len(set(control_RDs  )), "control_RDs contains duplicates"
-        assert len(monitor_RDs)   == len(set(monitor_RDs  )), "monitor_RDs contains duplicates"
+        assert len(monitor_PVs)   == len(set(monitor_PVs  )), "monitor_PVs contains duplicates"
 
         assert set(control_CSETs).isdisjoint(set(control_RDs)), "control_CSETs and control_RDs should be disjoint. If control_RDs is None, all PVs in control_CSETs must end with '_CSET'."
-        assert set(monitor_RDs).isdisjoint(set(control_CSETs + control_RDs)), "monitor_RDs should be disjoint from control_CSETs and control_RDs."
+        assert set(monitor_PVs).isdisjoint(set(control_CSETs + control_RDs)), "monitor_PVs should be disjoint from control_CSETs and control_RDs."
 
         self.control_CSETs = control_CSETs
         self.control_RDs = control_RDs
-        self.monitor_RDs = monitor_RDs
-        self.all_PVs = self.control_CSETs + self.control_RDs + self.monitor_RDs
+        self.monitor_PVs = monitor_PVs
+        self.all_PVs = self.control_CSETs + self.control_RDs + self.monitor_PVs
 
         self.control_min = np.array(control_min) if control_min is not None else np.zeros(len(control_CSETs))
         self.control_max = np.array(control_max) if control_max is not None else np.ones (len(control_CSETs))
@@ -175,11 +175,11 @@ class VirtualMachineIO:
             x0 = np.array(x0)
             assert np.all(x0 >= self.control_min) and np.all(x0 <= self.control_max), "x0 values must be within control_min and control_max bounds."
         self.x = np.array(x0).copy()
-        self.monitor_min = np.array(monitor_min) if monitor_min is not None else np.zeros(len(monitor_RDs  ))
-        self.monitor_max = np.array(monitor_max) if monitor_max is not None else np.ones (len(monitor_RDs  ))
+        self.monitor_min = np.array(monitor_min) if monitor_min is not None else np.zeros(len(monitor_PVs  ))
+        self.monitor_max = np.array(monitor_max) if monitor_max is not None else np.ones (len(monitor_PVs  ))
             
         if fun is None:
-            randNN = RandomNeuralNetwork(len(self.control_CSETs), len(self.monitor_RDs))
+            randNN = RandomNeuralNetwork(len(self.control_CSETs), len(self.monitor_PVs))
             x_test = np.random.rand(1024*32, len(self.control_CSETs))
             y_test = randNN(x_test)
             self.y_min = np.min(y_test, axis=0)
@@ -222,7 +222,7 @@ class VirtualMachineIO:
     def __call__(self,x=None):
         if x is not None:
             self.x = np.array(x).copy()
-        self.xrd = self.x + np.random.rand(len(self.control_CSETs))*(self.control_max-self.control_min)*1e-9
+        self.xrd = self.x + np.random.rand(len(self.control_CSETs))*(self.control_max-self.control_min)*1e-4
         self.y = self.fun(self.xrd)
         
 

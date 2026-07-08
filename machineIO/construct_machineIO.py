@@ -390,6 +390,8 @@ class AbstractMachineIO(ABC):
         self._n_popup_ramping_issue = 0
         self._history_lock = Lock()
         self.history = []
+        self.last_ensure_set_timing = {}
+        self.last_fetch_data_timing = {}
 
         # NEW: configurable list of PVs that require manual control
         self.manual_CSETs = set(_validate_manual_CSETs(manual_CSETs))
@@ -444,6 +446,8 @@ class AbstractMachineIO(ABC):
             print("Ramping in progress...")
             display(pd.DataFrame(np.asarray(goal).reshape(1, -1), columns=setpoint_pv))
 
+        total_t0 = time.perf_counter()
+        base_t0 = time.perf_counter()
         ret, data = self._ensure_set(
             setpoint_pv,
             readback_pv,
@@ -454,6 +458,7 @@ class AbstractMachineIO(ABC):
             extra_monitors=extra_monitors,
             **kws,
         )
+        base_dt = time.perf_counter() - base_t0
 
         if ret == "Timeout":
             if self._n_popup_ramping_issue < 2:
@@ -462,7 +467,9 @@ class AbstractMachineIO(ABC):
             else:
                 logger.warning("'ramping_not_OK' issued 2 times already. Ignoring from now on...")
 
+        wait_t0 = time.perf_counter()
         time.sleep(self._ensure_set_timewait_after_ramp)
+        wait_dt = time.perf_counter() - wait_t0
         self._record_history(
             caller="ensure_set",
             setpoint_pv=setpoint_pv,
@@ -472,6 +479,11 @@ class AbstractMachineIO(ABC):
             ret=ret,
             data=data,
         )
+        self.last_ensure_set_timing = {
+            "machineio_ensure_set_base": base_dt,
+            "machineio_ensure_set_wait_after_ramp": wait_dt,
+            "machineio_ensure_set_total": time.perf_counter() - total_t0,
+        }
         return ret, data
 
     def _fetch_data(self, pvlist: List[str], time_span: float, sample_interval: float, **kws):
@@ -486,14 +498,21 @@ class AbstractMachineIO(ABC):
         **kws,
     ):
         pvlist = unique_preserve_order(pvlist)
+        total_t0 = time.perf_counter()
+        fetch_t0 = time.perf_counter()
         data = self._fetch_data(
             pvlist,
             time_span=time_span or self._fetch_data_time_span,
             sample_interval=sample_interval or self._sample_interval,
             **kws,
         )
+        fetch_dt = time.perf_counter() - fetch_t0
         if self._verbose if verbose is None else verbose:
             display(data)
+        self.last_fetch_data_timing = {
+            "machineio_fetch_data": fetch_dt,
+            "machineio_fetch_data_total": time.perf_counter() - total_t0,
+        }
         return data
 
 
@@ -653,19 +672,36 @@ class EvaluatorBase:
 
         self._history_lock = Lock()
         self.history = {"mean": [], "var": [], "ramping_mean": [], "ramping_var": []}
+        self.last_read_timing = {}
+        self.last_timing = {}
 
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
     def read(self, fetch_data_kwargs: Optional[Dict] = None):
         fetch_data_kwargs = fetch_data_kwargs or self.fetch_data_kwargs
+        timing = {}
+        fetch_t0 = time.perf_counter()
         df = self.machineIO.fetch_data(self.fetch_data_monitors, **fetch_data_kwargs)
+        timing["oracle_fetch_data"] = time.perf_counter() - fetch_t0
+        timing.update(getattr(self.machineIO, "last_fetch_data_timing", {}) or {})
+
+        validate_t0 = time.perf_counter()
         df = validate_df_rows(df, self.vector_PVs, self.vector_len)
+        timing["oracle_validate_data"] = time.perf_counter() - validate_t0
+
+        manip_t0 = time.perf_counter()
         if self.df_manipulators is not None:
             for f in self.df_manipulators:
                 if callable(f):
                     df = f(df)
                 else:
                     raise ValueError(f"df_manipulators should be callable, got {type(f).__name__}")
+        timing["oracle_df_manipulators"] = time.perf_counter() - manip_t0
+        timing["oracle_read_total"] = sum(
+            timing.get(k, 0.0)
+            for k in ("oracle_fetch_data", "oracle_validate_data", "oracle_df_manipulators")
+        )
+        self.last_read_timing = timing
         return df
 
     # ---------- manual-controls support ----------
@@ -762,10 +798,13 @@ class EvaluatorBase:
         if len(x_arr) != len(self.control_CSETs):
             raise ValueError(f"x length ({len(x_arr)}) must match control_CSETs length ({len(self.control_CSETs)})")
 
+        timing = {}
+        total_t0 = time.perf_counter()
         manual, auto = self._split_manual_controls(x_arr)
 
         # FULL manual mode: prompt only if in main thread (direct calls)
         if self.set_manually:
+            manual_t0 = time.perf_counter()
             if threading.current_thread() is threading.main_thread():
                 df = pd.DataFrame([x_arr], columns=self.control_CSETs)
                 try:
@@ -774,9 +813,11 @@ class EvaluatorBase:
                     print(df.to_string(index=False))
                 input("Set the above PVs manually, then press Enter to continue...")
             ret, ramping_data = "PutFinish", None
+            timing["oracle_manual_prompt"] = time.perf_counter() - manual_t0
         else:
             # If there is a manual subset, prompt only in main thread (avoid worker-thread hangs)
             if manual is not None and threading.current_thread() is threading.main_thread():
+                manual_t0 = time.perf_counter()
                 self._prompt_manual_set_subset(
                     manual["csets"],
                     manual["rds"],
@@ -785,11 +826,13 @@ class EvaluatorBase:
                     timeout=ensure_set_kwargs.get("timeout", None),
                     sample_interval=ensure_set_kwargs.get("sample_interval", None),
                 )
+                timing["oracle_manual_prompt"] = time.perf_counter() - manual_t0
 
             extra_monitors = list(self.ensure_set_monitors)
             if manual is not None:
                 extra_monitors = unique_preserve_order(extra_monitors + manual["csets"] + manual["rds"])
 
+            ensure_t0 = time.perf_counter()
             ret, ramping_data = self.machineIO.ensure_set(
                 auto["csets"],
                 auto["rds"],
@@ -798,26 +841,43 @@ class EvaluatorBase:
                 extra_monitors=extra_monitors,
                 **ensure_set_kwargs,
             )
+            timing["oracle_ensure_set"] = time.perf_counter() - ensure_t0
+            timing.update(getattr(self.machineIO, "last_ensure_set_timing", {}) or {})
 
             if ramping_data is not None:
+                ramp_validate_t0 = time.perf_counter()
                 ramping_data = validate_df_rows(ramping_data, self.vector_PVs, self.vector_len)
+                timing["oracle_ramping_validate"] = time.perf_counter() - ramp_validate_t0
+
+                ramp_manip_t0 = time.perf_counter()
                 if self.df_manipulators is not None:
                     for f in self.df_manipulators:
                         if callable(f):
                             ramping_data = f(ramping_data)
                         else:
                             raise ValueError(f"df_manipulators should be callable, got {type(f).__name__}")
+                timing["oracle_ramping_df_manipulators"] = time.perf_counter() - ramp_manip_t0
 
+                ramp_stats_t0 = time.perf_counter()
                 ramping_mean, ramping_var = df_mean_var(ramping_data)
                 with self._history_lock:
                     self.history["ramping_mean"].append(ramping_mean)
                     self.history["ramping_var"].append(ramping_var)
+                timing["oracle_ramping_stats"] = time.perf_counter() - ramp_stats_t0
 
+        read_t0 = time.perf_counter()
         data = self.read(fetch_data_kwargs=fetch_data_kwargs)
+        timing["oracle_read"] = time.perf_counter() - read_t0
+        timing.update(self.last_read_timing)
+
+        stats_t0 = time.perf_counter()
         mean, var = df_mean_var(data)
         with self._history_lock:
             self.history["mean"].append(mean)
             self.history["var"].append(var)
+        timing["oracle_stats"] = time.perf_counter() - stats_t0
+        timing["oracle_set_and_read_total"] = time.perf_counter() - total_t0
+        self.last_timing = timing
 
         return data, ramping_data
 
@@ -1081,19 +1141,32 @@ class OracleEvaluator(Evaluator):
         self.oracle_key_names = {k: (v if isinstance(v, list) else [v]) for k, v in oracle_key_names.items()}
 
     def __call__(self, x=None):
+        call_t0 = time.perf_counter()
         if x is None:
-            mean = self.read().mean()
-            return {k: _to_float_array(mean[names]) for k, names in self.oracle_key_names.items()}
+            df = self.read()
+            timing = dict(getattr(self, "last_read_timing", {}) or {})
+            result_t0 = time.perf_counter()
+            mean = df.mean()
+            out = {k: _to_float_array(mean[names]) for k, names in self.oracle_key_names.items()}
+            timing["oracle_result_processing"] = time.perf_counter() - result_t0
+            timing["oracle_call_total"] = time.perf_counter() - call_t0
+            out["timing"] = timing
+            return out
 
         df, ramping_df = self._set_and_read(x)
+        timing = dict(getattr(self, "last_timing", {}) or {})
+        result_t0 = time.perf_counter()
         mean = df.mean()
         out = {k: _to_float_array(mean[names]) for k, names in self.oracle_key_names.items()}
+        timing["oracle_result_processing"] = time.perf_counter() - result_t0
+        timing["oracle_call_total"] = time.perf_counter() - call_t0
 
         # if ramping_df is not None:
         #     ramping_mean = ramping_df.mean()
         #     out.update(
         #         {f"ramping_{k}": _to_float_array(ramping_mean[names]) for k, names in self.oracle_key_names.items()}
         #     )
+        out["timing"] = timing
         return out
     
 
@@ -1171,8 +1244,11 @@ class StatefulOracleEvaluator(OracleEvaluator):
         self.oracle_key_names["state"] = ["state"]
 
     def __call__(self, x=None, s=None):
+        call_t0 = time.perf_counter()
         if x is None:
             df = self.read()
+            timing = dict(getattr(self, "last_read_timing", {}) or {})
+            result_t0 = time.perf_counter()
             state_vals = df[self.state_CSETs].mean()
             state = s
             if state is None:
@@ -1181,16 +1257,22 @@ class StatefulOracleEvaluator(OracleEvaluator):
                         state = s_name
                         break
 
+            state_manip_t0 = time.perf_counter()
             if self.state_df_manipulators is not None:
                 for f in self.state_df_manipulators:
                     if callable(f):
                         df = f(df, s=state)
                     else:
                         raise ValueError(f"state_df_manipulators should be callable, got {type(f).__name__}")
+            timing["oracle_state_df_manipulators"] = time.perf_counter() - state_manip_t0
 
             mean = df.mean()
             mean["state"] = state
-            return {k: _to_float_array(mean[names]) for k, names in self.oracle_key_names.items()}
+            out = {k: _to_float_array(mean[names]) for k, names in self.oracle_key_names.items()}
+            timing["oracle_result_processing"] = time.perf_counter() - result_t0
+            timing["oracle_call_total"] = time.perf_counter() - call_t0
+            out["timing"] = timing
+            return out
 
         assert s is not None
         x_arr = np.asarray(x, dtype=float).ravel()
@@ -1198,25 +1280,33 @@ class StatefulOracleEvaluator(OracleEvaluator):
         full_x = np.concatenate([x_arr, s_arr])
 
         df, ramping_df = self._set_and_read(full_x)
+        timing = dict(getattr(self, "last_timing", {}) or {})
 
+        state_manip_t0 = time.perf_counter()
         if self.state_df_manipulators is not None:
             for f in self.state_df_manipulators:
                 if callable(f):
                     df = f(df, s=s)
                 else:
                     raise ValueError(f"state_df_manipulators should be callable, got {type(f).__name__}")
+        timing["oracle_state_df_manipulators"] = time.perf_counter() - state_manip_t0
 
+        result_t0 = time.perf_counter()
         mean = df.mean()
         mean["state"] = s
         out = {k: _to_float_array(mean[names]) for k, names in self.oracle_key_names.items()}
+        timing["oracle_result_processing"] = time.perf_counter() - result_t0
+        timing["oracle_call_total"] = time.perf_counter() - call_t0
 
         if ramping_df is not None:
+            state_ramp_manip_t0 = time.perf_counter()
             if self.state_df_manipulators is not None:
                 for f in self.state_df_manipulators:
                     if callable(f):
                         ramping_df = f(ramping_df, s=s)
                     else:
                         raise ValueError(f"state_df_manipulators should be callable, got {type(f).__name__}")
+            timing["oracle_state_ramping_df_manipulators"] = time.perf_counter() - state_ramp_manip_t0
 
             # ramping_mean = ramping_df.mean()
             # if np.all(np.abs(ramping_mean[self.state_RDs] - mean[self.state_RDs]) < self.state_tols):
@@ -1224,6 +1314,7 @@ class StatefulOracleEvaluator(OracleEvaluator):
             #     out.update(
             #         {f"ramping_{k}": _to_float_array(ramping_mean[names]) for k, names in self.oracle_key_names.items()}
             #     )
+        out["timing"] = timing
         return out
 
 
