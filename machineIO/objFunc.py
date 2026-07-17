@@ -1,7 +1,8 @@
 import torch
 import numpy as np
 from collections import OrderedDict
-from typing import List, Dict, Optional, Callable
+from pathlib import Path
+from typing import Any, List, Dict, Optional, Callable
 
 
 try:
@@ -15,6 +16,7 @@ def display(obj):
         print(obj)
 
 from .util import cyclic_distance, elu
+from .dump_utils import read_hdf5_dump, to_builtin, write_hdf5_dump
 
 
 
@@ -109,13 +111,48 @@ class SingleTaskObjectiveFunction:
             assert objective_tolerance is not None
             assert isinstance(p_order, int) and p_order > 0, "p_order must be a positive integer"
             assert isinstance(apply_bilog, bool), "apply_bilog must be a boolean"
-            self.objective_weight = OrderedDict([(pv,objective_weight[pv]) for pv in objective_PVs])
-            weight_sum = np.sum(list(self.objective_weight.values()))
-            self.objective_weight = {k:v/weight_sum for k,v in self.objective_weight.items()}
             self.objective_goal   = OrderedDict([(pv,objective_goal[pv]) for pv in objective_PVs])
             self.objective_tolerance = OrderedDict([(pv,objective_tolerance[pv]) for pv in objective_PVs])
             self.p_order = p_order
             self.apply_bilog = apply_bilog
+            self.set_objective_weight(objective_weight)
+
+    def set_objective_weight(self, new_weight: Dict[str, float]) -> Dict[str, float]:
+        if self.custom_function is not None:
+            raise ValueError("Cannot update objective_weight for a custom-function objective.")
+
+        if not isinstance(new_weight, dict):
+            raise TypeError("new_weight must be a dict keyed by objective PV name.")
+
+        expected = list(self.objective_PVs)
+        expected_set = set(expected)
+        provided_set = set(new_weight)
+        if provided_set != expected_set:
+            missing = sorted(expected_set - provided_set)
+            extra = sorted(provided_set - expected_set)
+            raise ValueError(
+                "new_weight keys must match objective_PVs exactly. "
+                f"Missing: {missing}; extra: {extra}"
+            )
+
+        ordered_weight = OrderedDict()
+        for pv in expected:
+            value = new_weight[pv]
+            if not isinstance(value, (int, float, np.number)):
+                raise TypeError(f"Weight for {pv!r} must be numeric, got {type(value).__name__}.")
+            value = float(value)
+            if not np.isfinite(value):
+                raise ValueError(f"Weight for {pv!r} must be finite.")
+            if value < 0:
+                raise ValueError(f"Weight for {pv!r} must be non-negative.")
+            ordered_weight[pv] = value
+
+        weight_sum = float(np.sum(list(ordered_weight.values())))
+        if weight_sum <= 0:
+            raise ValueError("At least one objective weight must be positive.")
+
+        self.objective_weight = {pv: value / weight_sum for pv, value in ordered_weight.items()}
+        return dict(self.objective_weight)
 
 
     def __call__(self, 
@@ -179,3 +216,75 @@ class SingleTaskObjectiveFunction:
         composite_obj = self(df[self.objective_PVs].values)
         df[self.composite_objective_name] = composite_obj
         return df
+
+    def to_dump_dict(self) -> Dict[str, Any]:
+        custom_function = self.custom_function
+        payload = {
+            "class": type(self).__name__,
+            "module": type(self).__module__,
+            "format_version": 1,
+            "objective_PVs": list(self.objective_PVs),
+            "composite_objective_name": self.composite_objective_name,
+            "has_custom_function": custom_function is not None,
+            "custom_function_module": getattr(custom_function, "__module__", None) if custom_function is not None else None,
+            "custom_function_qualname": getattr(custom_function, "__qualname__", None) if custom_function is not None else None,
+            "custom_function_repr": repr(custom_function) if custom_function is not None else None,
+        }
+        if custom_function is None:
+            payload.update(
+                {
+                    "objective_goal": self.objective_goal,
+                    "objective_weight": self.objective_weight,
+                    "objective_tolerance": self.objective_tolerance,
+                    "p_order": self.p_order,
+                    "apply_bilog": self.apply_bilog,
+                }
+            )
+        return to_builtin(payload)
+
+    @classmethod
+    def from_dump_dict(
+        cls,
+        data: Dict[str, Any],
+        *,
+        custom_function: Optional[Callable] = None,
+    ) -> "SingleTaskObjectiveFunction":
+        has_custom_function = bool(data.get("has_custom_function", False))
+        if has_custom_function and custom_function is None:
+            raise ValueError(
+                "This objective-function dump used a custom callable. "
+                "Pass custom_function=... to restore executable behavior."
+            )
+
+        return cls(
+            objective_PVs=list(data["objective_PVs"]),
+            composite_objective_name=data["composite_objective_name"],
+            custom_function=custom_function if has_custom_function else None,
+            objective_goal=data.get("objective_goal"),
+            objective_weight=data.get("objective_weight"),
+            objective_tolerance=data.get("objective_tolerance"),
+            p_order=int(data.get("p_order", 2)),
+            apply_bilog=bool(data.get("apply_bilog", False)),
+        )
+
+    def dump(self, path: str | Path) -> Path:
+        payload = {
+            "format": "machineIO.SingleTaskObjectiveFunction.dump",
+            "format_version": 1,
+            "object": self.to_dump_dict(),
+        }
+        return write_hdf5_dump(path, payload)
+
+    @staticmethod
+    def read_dump(path: str | Path) -> Dict[str, Any]:
+        return read_hdf5_dump(path)
+
+    @classmethod
+    def from_dump(
+        cls,
+        path: str | Path,
+        *,
+        custom_function: Optional[Callable] = None,
+    ) -> "SingleTaskObjectiveFunction":
+        payload = cls.read_dump(path)
+        return cls.from_dump_dict(payload.get("object", payload), custom_function=custom_function)

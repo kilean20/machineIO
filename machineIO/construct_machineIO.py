@@ -9,7 +9,8 @@ import pandas as pd
 import concurrent
 import concurrent.futures
 import threading
-from typing import Optional, List, Union, Dict, Callable, Tuple
+from pathlib import Path
+from typing import Any, Optional, List, Union, Dict, Callable, Tuple
 from copy import deepcopy as copy
 from abc import ABC, abstractmethod
 from threading import Lock
@@ -54,6 +55,8 @@ from .util import (
     df_mean,
     df_mean_var,
 )
+from .dump_utils import from_builtin, read_hdf5_dump, to_builtin, write_hdf5_dump
+from .objFunc import SingleTaskObjectiveFunction
 
 script_dir = os.path.dirname(os.path.realpath(__file__))
 sys.path.append(os.path.join(script_dir, "models/BPMQ"))
@@ -271,6 +274,127 @@ if epics_imported:
 # -------------------------
 # isOK wrappers
 # -------------------------
+_ISOK_MISSING = object()
+
+
+def _is_finite_number(value: Any) -> bool:
+    if isinstance(value, (bool, np.bool_)):
+        return False
+    if not isinstance(value, (int, float, np.integer, np.floating)):
+        return False
+    return bool(np.isfinite(float(value)))
+
+
+def _prepare_isOK_config(isOK_PVs, isOK_vals, test: bool = False):
+    """Validate and normalize per-PV health-check specifications."""
+    if test:
+        return [], []
+    if isOK_PVs is None and isOK_vals is None:
+        return [], []
+    if isOK_PVs is None or isOK_vals is None:
+        raise ValueError("isOK_PVs and isOK_vals must either both be provided or both be None")
+
+    pvs = list(isOK_PVs)
+    specs = list(isOK_vals)
+    if len(pvs) != len(specs):
+        raise ValueError("isOK_PVs and isOK_vals must have the same length")
+    if not all(isinstance(pv, str) and pv for pv in pvs):
+        raise TypeError("isOK_PVs must contain non-empty PV-name strings")
+    if len(set(pvs)) != len(pvs):
+        raise ValueError("isOK_PVs must not contain duplicate PV names")
+
+    for pv, spec in zip(pvs, specs):
+        if isinstance(spec, str) or _is_finite_number(spec):
+            continue
+        if not isinstance(spec, dict):
+            raise TypeError(
+                f"isOK value for {pv!r} must be a string, finite number, "
+                "or {'target': number, 'tolerance': non-negative number}"
+            )
+        if set(spec) != {"target", "tolerance"}:
+            raise ValueError(
+                f"range check for {pv!r} must contain exactly 'target' and 'tolerance'"
+            )
+        if not _is_finite_number(spec["target"]):
+            raise TypeError(f"range target for {pv!r} must be a finite number")
+        if not _is_finite_number(spec["tolerance"]) or float(spec["tolerance"]) < 0.0:
+            raise ValueError(f"range tolerance for {pv!r} must be a non-negative finite number")
+
+    return pvs, specs
+
+
+def _as_finite_float(value: Any):
+    try:
+        value = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return value if np.isfinite(value) else None
+
+
+def _epics_isOK_value(pv: str, *, as_string: bool):
+    """Read an enum's alternate representation when the fetch backend differs."""
+    if not epics_imported:
+        return _ISOK_MISSING
+    try:
+        value = epics_caget(pv, as_string=as_string)
+    except Exception as exc:
+        logger.debug("Could not read alternate isOK value for %s: %s", pv, exc)
+        return _ISOK_MISSING
+    return _ISOK_MISSING if value is None else value
+
+
+def _isOK_value_matches(pv: str, actual: Any, spec: Any) -> bool:
+    """Compare one fetched value against an exact or tolerance specification."""
+    if isinstance(spec, str):
+        if isinstance(actual, bytes):
+            actual = actual.decode(errors="replace")
+        if isinstance(actual, (str, np.str_)):
+            return str(actual) == spec
+
+        # PyEPICS may expose an enum as its integer index while PHANTASY exposes
+        # the same value as its label. Resolve the label only when needed.
+        label = _epics_isOK_value(pv, as_string=True)
+        return label is not _ISOK_MISSING and str(label) == spec
+
+    actual_number = _as_finite_float(actual)
+    if actual_number is None:
+        # Resolve a PHANTASY enum label to the raw numeric enum index.
+        raw_value = _epics_isOK_value(pv, as_string=False)
+        if raw_value is not _ISOK_MISSING:
+            actual_number = _as_finite_float(raw_value)
+    if actual_number is None:
+        return False
+
+    if isinstance(spec, dict):
+        target = float(spec["target"])
+        tolerance = float(spec["tolerance"])
+        roundoff = 4.0 * np.finfo(float).eps * max(1.0, abs(actual_number), abs(target))
+        return abs(actual_number - target) <= tolerance + roundoff
+    return actual_number == float(spec)
+
+
+def _check_isOK_values(df: pd.DataFrame, isOK_PVs, isOK_vals):
+    """Return whether all checks pass plus details for failed checks."""
+    if not isOK_PVs:
+        return True, {}
+    if df is None or df.empty:
+        return False, {pv: {"actual": None, "expected": spec} for pv, spec in zip(isOK_PVs, isOK_vals)}
+
+    missing = [pv for pv in isOK_PVs if pv not in df.columns]
+    failures = {
+        pv: {"actual": None, "expected": spec, "reason": "missing column"}
+        for pv, spec in zip(isOK_PVs, isOK_vals)
+        if pv in missing
+    }
+    for pv, spec in zip(isOK_PVs, isOK_vals):
+        if pv in missing:
+            continue
+        actual = df[pv].iloc[-1]
+        if not _isOK_value_matches(pv, actual, spec):
+            failures[pv] = {"actual": actual, "expected": spec}
+    return not failures, failures
+
+
 class _fetch_data_wrapper:
     def __init__(
         self,
@@ -279,23 +403,29 @@ class _fetch_data_wrapper:
         fetch_data_base=epics_fetch_data if DEFAULT_use_epics and epics_imported else phantasy_fetch_data if phantasy_imported else None,
         test=False,
     ):
-        assert fetch_data_base is not None, "epics or phantasy import failed"
+        if fetch_data_base is None and not test:
+            raise AssertionError("epics or phantasy import failed")
         self.fetch_data_base = fetch_data_base
-        self.isOK_PVs = [] if isOK_PVs is None or test else list(isOK_PVs)
-        self.isOK_vals = np.asarray([] if isOK_vals is None or test else isOK_vals, dtype=float)
-        if not test and isOK_PVs is not None and isOK_vals is not None:
-            assert len(isOK_PVs) == len(isOK_vals), "isOK_PVs and isOK_vals must have the same length"
+        self.isOK_PVs, self.isOK_vals = _prepare_isOK_config(isOK_PVs, isOK_vals, test=test)
+        self.test = bool(test)
 
     def __call__(self, pvlist: List[str], time_span: float, sample_interval: float, **kws):
         pvlist = unique_preserve_order(pvlist)
+        if self.test:
+            return pd.DataFrame(
+                [{pv: 0.0 for pv in pvlist}],
+                index=[datetime.datetime.now()],
+            )
         pvlist_expanded = unique_preserve_order(pvlist + [pv for pv in self.isOK_PVs if pv not in pvlist])
         df = self.fetch_data_base(pvlist_expanded, time_span, sample_interval=sample_interval)
 
-        # Prefer last sample for isOK PVs (more robust than mean for state PVs)
-        while self.isOK_PVs and np.any(df[self.isOK_PVs].iloc[-1].to_numpy(dtype=float) != self.isOK_vals):
-            logger.warning(f"notOK from {self.isOK_PVs} detected during fetch_data. Re-try in 5 sec... ")
+        # Prefer the last sample for isOK PVs (more robust than a mean for state PVs).
+        is_ok, failures = _check_isOK_values(df, self.isOK_PVs, self.isOK_vals)
+        while not is_ok:
+            logger.warning("notOK detected during fetch_data: %s. Re-try in 5 sec...", failures)
             time.sleep(5)
             df = self.fetch_data_base(pvlist_expanded, time_span, sample_interval=sample_interval)
+            is_ok, failures = _check_isOK_values(df, self.isOK_PVs, self.isOK_vals)
 
         return df[pvlist]
 
@@ -308,10 +438,10 @@ class _ensure_set_wrapper:
         ensure_set_base=epics_ensure_set if DEFAULT_use_epics and epics_imported else phantasy_ensure_set if phantasy_imported else None,
         test=False,
     ):
-        assert ensure_set_base is not None, "epics or phantasy import failed"
+        if ensure_set_base is None and not test:
+            raise AssertionError("epics or phantasy import failed")
         self.ensure_set_base = ensure_set_base
-        self.isOK_PVs = [] if isOK_PVs is None or test else list(isOK_PVs)
-        self.isOK_vals = np.asarray([] if isOK_vals is None or test else isOK_vals, dtype=float)
+        self.isOK_PVs, self.isOK_vals = _prepare_isOK_config(isOK_PVs, isOK_vals, test=test)
         self.test = test
 
     def __call__(
@@ -345,13 +475,10 @@ class _ensure_set_wrapper:
         if df is None:
             return ret, None
 
-        if self.isOK_PVs:
-            try:
-                ok_last = df[self.isOK_PVs].iloc[-1].to_numpy(dtype=float)
-                if np.any(ok_last != self.isOK_vals):
-                    return ret, None
-            except Exception:
-                return ret, None
+        is_ok, failures = _check_isOK_values(df, self.isOK_PVs, self.isOK_vals)
+        if not is_ok:
+            logger.warning("notOK detected during ensure_set: %s", failures)
+            return ret, None
 
         cols = unique_preserve_order(list(setpoint_pv) + list(readback_pv) + list(extra_monitors))
         cols_in = [c for c in cols if c in df.columns]
@@ -525,11 +652,17 @@ class construct_machineIO(AbstractMachineIO):
         sample_interval: float = DEFAULT_sample_interval,
         verbose=False,
         use_epics: bool = DEFAULT_use_epics,
-        isOK_PVs=DEFAULT_isOK_PVs,
-        isOK_vals=DEFAULT_isOK_vals,
+        isOK_PVs: Optional[List[str]] = DEFAULT_isOK_PVs,
+        isOK_vals: Optional[List[Union[str, int, float, Dict[str, float]]]] = DEFAULT_isOK_vals,
         manual_CSETs: Optional[List[str]] = None,  # NEW
         test: bool = False,
     ):
+        """Construct machine I/O with optional per-PV health checks.
+
+        Each ``isOK_vals`` entry is either an exact string, an exact number, or
+        ``{"target": number, "tolerance": non_negative_number}`` for an inclusive
+        numeric range. Entries correspond positionally to ``isOK_PVs``.
+        """
         super().__init__(
             ensure_set_timeout=ensure_set_timeout,
             ensure_set_timewait_after_ramp=ensure_set_timewait_after_ramp,
@@ -539,6 +672,7 @@ class construct_machineIO(AbstractMachineIO):
             manual_CSETs=manual_CSETs,
         )
         self.test = test
+        self.use_epics = bool(use_epics)
         self.isOK_PVs = isOK_PVs
         self.isOK_vals = isOK_vals
 
@@ -570,6 +704,96 @@ class construct_machineIO(AbstractMachineIO):
             epics_caput(pvname, value)
             return
         raise ValueError("EPICS is not imported. Cannot caput.")
+
+    def to_dump_dict(self, *, include_history: bool = True) -> Dict[str, Any]:
+        payload = {
+            "class": type(self).__name__,
+            "module": type(self).__module__,
+            "format_version": 1,
+            "config": {
+                "ensure_set_timeout": self._ensure_set_timeout,
+                "ensure_set_timewait_after_ramp": self._ensure_set_timewait_after_ramp,
+                "fetch_data_time_span": self._fetch_data_time_span,
+                "sample_interval": self._sample_interval,
+                "verbose": self._verbose,
+                "use_epics": self.use_epics,
+                "isOK_PVs": None if self.isOK_PVs is None else list(self.isOK_PVs),
+                "isOK_vals": None if self.isOK_vals is None else to_builtin(self.isOK_vals),
+                "manual_CSETs": sorted(self.manual_CSETs),
+                "test": self.test,
+            },
+            "state": {
+                "last_ensure_set_timing": self.last_ensure_set_timing,
+                "last_fetch_data_timing": self.last_fetch_data_timing,
+            },
+        }
+        if include_history:
+            payload["state"]["history"] = self.history
+        return to_builtin(payload)
+
+    @classmethod
+    def from_dump_dict(
+        cls,
+        data: Dict[str, Any],
+        *,
+        restore_history: bool = True,
+        use_epics: Optional[bool] = None,
+        test: Optional[bool] = None,
+    ) -> "construct_machineIO":
+        config = dict(data.get("config", data))
+        if use_epics is not None:
+            config["use_epics"] = bool(use_epics)
+        if test is not None:
+            config["test"] = bool(test)
+
+        machine = cls(
+            ensure_set_timeout=int(config.get("ensure_set_timeout", 20)),
+            ensure_set_timewait_after_ramp=float(config.get("ensure_set_timewait_after_ramp", 0.3)),
+            fetch_data_time_span=float(config.get("fetch_data_time_span", 2.0)),
+            sample_interval=float(config.get("sample_interval", DEFAULT_sample_interval)),
+            verbose=bool(config.get("verbose", False)),
+            use_epics=bool(config.get("use_epics", DEFAULT_use_epics)),
+            isOK_PVs=config.get("isOK_PVs", DEFAULT_isOK_PVs),
+            isOK_vals=config.get("isOK_vals", DEFAULT_isOK_vals),
+            manual_CSETs=config.get("manual_CSETs", None),
+            test=bool(config.get("test", False)),
+        )
+
+        state = from_builtin(data.get("state", {}) or {})
+        machine.last_ensure_set_timing = dict(state.get("last_ensure_set_timing", {}) or {})
+        machine.last_fetch_data_timing = dict(state.get("last_fetch_data_timing", {}) or {})
+        if restore_history:
+            machine.history = list(state.get("history", []) or [])
+        return machine
+
+    def dump(self, path: str | Path, *, include_history: bool = True) -> Path:
+        payload = {
+            "format": "machineIO.construct_machineIO.dump",
+            "format_version": 1,
+            "object": self.to_dump_dict(include_history=include_history),
+        }
+        return write_hdf5_dump(path, payload)
+
+    @staticmethod
+    def read_dump(path: str | Path) -> Dict[str, Any]:
+        return read_hdf5_dump(path)
+
+    @classmethod
+    def from_dump(
+        cls,
+        path: str | Path,
+        *,
+        restore_history: bool = True,
+        use_epics: Optional[bool] = None,
+        test: Optional[bool] = None,
+    ) -> "construct_machineIO":
+        payload = cls.read_dump(path)
+        return cls.from_dump_dict(
+            payload.get("object", payload),
+            restore_history=restore_history,
+            use_epics=use_epics,
+            test=test,
+        )
 
 
 # -------------------------
@@ -946,12 +1170,16 @@ class EvaluatorBase:
             self.history = {"mean": [], "var": [], "ramping_mean": [], "ramping_var": []}
 
     def dump_history(self, filename: str):
-        """Dump the history dict (dataframes) to a pkl file."""
-        if not filename.endswith(".pkl"):
-            filename += ".pkl"
-        history = self.get_history(ignore_index=True)
-        with open(filename, "wb") as f:
-            pd.to_pickle(history, f)
+        """Dump the history dict to an HDF5 file without pickle."""
+        path = Path(filename)
+        if path.suffix.lower() not in {".h5", ".hdf5"}:
+            path = path.with_suffix(".h5")
+        payload = {
+            "format": "machineIO.EvaluatorBase.history.dump",
+            "format_version": 1,
+            "history": self.get_history(ignore_index=True),
+        }
+        return write_hdf5_dump(path, payload)
 
 
 # -------------------------
@@ -1022,6 +1250,10 @@ class Evaluator(EvaluatorBase):
         df_manipulators: Optional[List[Callable]] = None,
     ):
         _validate_control_couplings(control_couplings, control_CSETs)
+        self.control_couplings = copy(control_couplings) if control_couplings is not None else None
+        self._constructor_control_CSETs = list(control_CSETs)
+        self._constructor_control_RDs = list(control_RDs)
+        self._constructor_control_tols = np.asarray(control_tols, dtype=float)
         if control_couplings is not None:
             control_CSETs, control_RDs, control_tols, coupling_indices = _precompute_control_couplings_and_indices(
                 control_couplings, control_CSETs, control_RDs, control_tols
@@ -1111,6 +1343,63 @@ def _to_float_array(series):
     return series.to_numpy()
 
 
+def _series_history_to_dump(history: Dict[str, List[pd.Series]]) -> Dict[str, List[Dict[str, Any]]]:
+    out = {}
+    for key, values in (history or {}).items():
+        records = []
+        for value in values:
+            if hasattr(value, "to_dict"):
+                records.append(to_builtin(value.to_dict()))
+            else:
+                records.append(to_builtin(value))
+        out[str(key)] = records
+    return out
+
+
+def _series_history_from_dump(history: Dict[str, List[Dict[str, Any]]]) -> Dict[str, List[pd.Series]]:
+    restored = {"mean": [], "var": [], "ramping_mean": [], "ramping_var": []}
+    for key, values in (history or {}).items():
+        series_list = []
+        for value in values or []:
+            value = from_builtin(value)
+            if isinstance(value, pd.Series):
+                series_list.append(value)
+            elif isinstance(value, dict):
+                series_list.append(pd.Series(value))
+            else:
+                series_list.append(pd.Series(value))
+        restored[str(key)] = series_list
+    for key in ("mean", "var", "ramping_mean", "ramping_var"):
+        restored.setdefault(key, [])
+    return restored
+
+
+def _df_manipulator_descriptor(func: Callable) -> Dict[str, Any]:
+    owner = getattr(func, "__self__", None)
+    if (
+        isinstance(owner, SingleTaskObjectiveFunction)
+        and getattr(func, "__name__", "") == "calculate_objectives_from_df"
+    ):
+        return {"kind": "SingleTaskObjectiveFunction.calculate_objectives_from_df"}
+    return {
+        "kind": "unsupported_callable",
+        "module": getattr(func, "__module__", None),
+        "qualname": getattr(func, "__qualname__", None),
+        "repr": repr(func),
+    }
+
+
+def _find_single_task_objective(df_manipulators: Optional[List[Callable]]) -> Optional[SingleTaskObjectiveFunction]:
+    for func in df_manipulators or []:
+        owner = getattr(func, "__self__", None)
+        if (
+            isinstance(owner, SingleTaskObjectiveFunction)
+            and getattr(func, "__name__", "") == "calculate_objectives_from_df"
+        ):
+            return owner
+    return None
+
+
 class OracleEvaluator(Evaluator):
     def __init__(
         self,
@@ -1198,6 +1487,155 @@ class OracleEvaluator(Evaluator):
 
         mean = df.mean()
         return {k: _to_float_array(mean[names]) for k, names in self.oracle_key_names.items()}
+
+    def to_dump_dict(self, *, include_history: bool = True) -> Dict[str, Any]:
+        objective_function = _find_single_task_objective(self.df_manipulators)
+        df_manipulators = [
+            _df_manipulator_descriptor(func)
+            for func in (self.df_manipulators or [])
+        ]
+        payload = {
+            "class": type(self).__name__,
+            "module": type(self).__module__,
+            "format_version": 1,
+            "machineIO": (
+                self.machineIO.to_dump_dict(include_history=include_history)
+                if hasattr(self.machineIO, "to_dump_dict")
+                else None
+            ),
+            "objective_function": objective_function.to_dump_dict() if objective_function is not None else None,
+            "config": {
+                "control_CSETs": getattr(self, "_constructor_control_CSETs", self.control_CSETs),
+                "control_RDs": getattr(self, "_constructor_control_RDs", self.control_RDs),
+                "control_tols": getattr(self, "_constructor_control_tols", self.control_tols),
+                "monitor_PVs": self.monitor_PVs,
+                "oracle_key_names": self.oracle_key_names,
+                "control_couplings": getattr(self, "control_couplings", None),
+                "ensure_set_kwargs": self.ensure_set_kwargs,
+                "fetch_data_kwargs": self.fetch_data_kwargs,
+                "set_manually": self.set_manually,
+                "df_manipulators": df_manipulators,
+            },
+            "state": {
+                "last_read_timing": self.last_read_timing,
+                "last_timing": self.last_timing,
+            },
+        }
+        if include_history:
+            payload["state"]["history"] = _series_history_to_dump(self.history)
+        return to_builtin(payload)
+
+    def _restore_state_from_dump_dict(self, state: Dict[str, Any], *, restore_history: bool = True) -> None:
+        state = from_builtin(state or {})
+        self.last_read_timing = dict(state.get("last_read_timing", {}) or {})
+        self.last_timing = dict(state.get("last_timing", {}) or {})
+        if restore_history:
+            self.history = _series_history_from_dump(state.get("history", {}) or {})
+
+    @classmethod
+    def from_dump_dict(
+        cls,
+        data: Dict[str, Any],
+        *,
+        machineIO=None,
+        objective_function: Optional[SingleTaskObjectiveFunction] = None,
+        custom_objective_function: Optional[Callable] = None,
+        restore_history: bool = True,
+        use_epics: Optional[bool] = None,
+        test: Optional[bool] = None,
+        allow_unsupported_df_manipulators: bool = False,
+    ) -> "OracleEvaluator":
+        data = dict(data)
+        config = dict(data.get("config", {}) or {})
+
+        if machineIO is None:
+            machine_data = data.get("machineIO")
+            if machine_data is None:
+                raise ValueError("OracleEvaluator dump does not contain machineIO data.")
+            machineIO = construct_machineIO.from_dump_dict(
+                machine_data,
+                restore_history=restore_history,
+                use_epics=use_epics,
+                test=test,
+            )
+
+        objective_data = data.get("objective_function")
+        if objective_function is None and objective_data is not None:
+            objective_function = SingleTaskObjectiveFunction.from_dump_dict(
+                objective_data,
+                custom_function=custom_objective_function,
+            )
+
+        df_manipulators = []
+        for descriptor in config.get("df_manipulators", []) or []:
+            kind = descriptor.get("kind") if isinstance(descriptor, dict) else None
+            if kind == "SingleTaskObjectiveFunction.calculate_objectives_from_df":
+                if objective_function is None:
+                    raise ValueError(
+                        "Dump requests a SingleTaskObjectiveFunction dataframe manipulator "
+                        "but no objective_function was available."
+                    )
+                df_manipulators.append(objective_function.calculate_objectives_from_df)
+            elif allow_unsupported_df_manipulators:
+                continue
+            else:
+                raise ValueError(
+                    "Cannot restore unsupported dataframe manipulator from dump: "
+                    f"{descriptor}"
+                )
+
+        oracle = cls(
+            machineIO,
+            control_CSETs=list(config["control_CSETs"]),
+            control_RDs=list(config["control_RDs"]),
+            control_tols=np.asarray(config["control_tols"], dtype=float),
+            monitor_PVs=list(config.get("monitor_PVs", [])),
+            oracle_key_names=dict(config["oracle_key_names"]),
+            control_couplings=config.get("control_couplings", None),
+            ensure_set_kwargs=dict(config.get("ensure_set_kwargs", {}) or {}),
+            fetch_data_kwargs=dict(config.get("fetch_data_kwargs", {}) or {}),
+            set_manually=bool(config.get("set_manually", False)),
+            df_manipulators=df_manipulators or None,
+        )
+        oracle._restore_state_from_dump_dict(data.get("state", {}) or {}, restore_history=restore_history)
+        return oracle
+
+    def dump(self, path: str | Path, *, include_history: bool = True) -> Path:
+        payload = {
+            "format": "machineIO.OracleEvaluator.dump",
+            "format_version": 1,
+            "object": self.to_dump_dict(include_history=include_history),
+        }
+        return write_hdf5_dump(path, payload)
+
+    @staticmethod
+    def read_dump(path: str | Path) -> Dict[str, Any]:
+        return read_hdf5_dump(path)
+
+    @classmethod
+    def from_dump(
+        cls,
+        path: str | Path,
+        *,
+        machineIO=None,
+        objective_function: Optional[SingleTaskObjectiveFunction] = None,
+        custom_objective_function: Optional[Callable] = None,
+        restore_history: bool = True,
+        use_epics: Optional[bool] = None,
+        test: Optional[bool] = None,
+        allow_unsupported_df_manipulators: bool = False,
+    ) -> "OracleEvaluator":
+        payload = cls.read_dump(path)
+        return cls.from_dump_dict(
+            payload.get("object", payload),
+            machineIO=machineIO,
+            objective_function=objective_function,
+            custom_objective_function=custom_objective_function,
+            restore_history=restore_history,
+            use_epics=use_epics,
+            test=test,
+            allow_unsupported_df_manipulators=allow_unsupported_df_manipulators,
+        )
 
 
 class StatefulOracleEvaluator(OracleEvaluator):
